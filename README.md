@@ -14,9 +14,10 @@ the training-step throughput went from 317 to 912 TFLOPS.
 | Path | What it is |
 |---|---|
 | `rules/iteration_rules.mdc` | Hard rules for a campaign: one variable per round, correctness first, full validation, accept/rollback lineage, gains must transfer to a real training step |
-| `skills/kernel-optimize/` | The optimization loop, plus a knowledge base by op (`gemm`, `attention`), hardware (`gfx942`, `gfx950`, `gfx1250`) and backend (`flydsl`) |
+| `skills/kernel-optimize/` | The optimization loop, plus a knowledge base by op (`gemm`, `attention`), hardware (`gfx942`, `gfx950`, `gfx1250`), backend (`flydsl`, `triton`) and numerics (batch invariance) |
 | `skills/primus-turbo-develop/` | Primus-Turbo project skill: architecture, accuracy and performance verification, profiling, handoff to `kernel-optimize`. It is an example of the project-skill contract that `kernel-optimize` expects |
 | `historical_experience/gfx1250/sparse_mla_fwd_bwd/flydsl/` | `tips.md` (per-round signal / takeaway entries) and `lessons_learned.md` (campaign retrospective) |
+| `historical_experience/gfx950/paged_attention/triton/` | `tips.md` from the OneTensor batch-invariant paged attention work on MI355X |
 | `tools/` | ISA analysis helpers for FlyDSL IR dumps: `isa_loop_hist.py` (hot-loop mnemonic histogram and diff), `isa_seq.py` (run-length op sequence) |
 
 New in this repo:
@@ -30,6 +31,16 @@ New in this repo:
   rescale, exp2 folding, the MLA shared-latent dKV, closed-form band masks, on-chip dKV
   accumulation, deterministic reductions, the sink gradient and valid-slot loop bounds.
 - The gfx1250 sparse-MLA historical experience and the `tools/` scripts.
+- [`skills/kernel-optimize/knowledge/numerics/batch-invariance.md`](skills/kernel-optimize/knowledge/numerics/batch-invariance.md):
+  how to keep a kernel bitwise stable across batch shapes and between inference and training
+  (aligned split-K / split-KV, split vs fused modes, exact online-softmax no-ops, masked loads, and
+  the measured gfx950 rule that launch layouts with warps on both tile axes change bits).
+- [`skills/kernel-optimize/knowledge/backend/triton/pitfalls.md`](skills/kernel-optimize/knowledge/backend/triton/pitfalls.md)
+  and the gfx950 paged-attention tips (`historical_experience/gfx950/paged_attention/triton/`).
+
+To use the skills from a project while still editing them, add this repo as a git submodule and
+symlink `.cursor/skills`, `.cursor/rules` and `agent/historical_experience` to its `skills/`,
+`rules/` and `historical_experience/` (OneTensor does this).
 
 ## Installing Into a Project
 
