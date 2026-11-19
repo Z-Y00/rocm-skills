@@ -55,6 +55,16 @@ its own backend choice. Numerical rules: [`knowledge/numerics/batch-invariance.m
   (q_len <= 16); for split with many programs (> 512) use fewer warps / 1 stage (32x32k: 887 -> 738 us).
 - Applicability: choosing split-KV vs single pass in batch-invariant attention.
 
+### 2026-11-18 — decode stays bandwidth-bound at any batch size
+- Context: whether larger decode batches make attention compute-bound.
+- Signal: batch 256 x 2k context decode ran 347 us for ~2.15 GB of K/V (256 x 2048 tokens x 8 KV
+  heads x 128 dims x 2 x 2 bytes), ~6.2 TB/s, close to HBM peak, with 25-50 % MFMA row use.
+- Takeaway: each sequence has its own KV, so batch adds programs, not reuse per KV tile; rows per KV
+  tile stay GQA group x query tokens. Head packing (read each KV tile once per KV head) and enough
+  programs matter far more than MFMA row utilization. The exception is a shared prompt (GRPO), where
+  N responses reuse the prompt's KV.
+- Applicability: choosing decode tiling and MFMA shape on gfx950.
+
 ### 2026-11-10 — launch layout changes bits
 - Context: bitwise comparison across (BLOCK_M, num_warps).
 - Signal: warps tiling both rows and columns of the score tile, e.g. (32, 4), (32, 8), (64, 8),
