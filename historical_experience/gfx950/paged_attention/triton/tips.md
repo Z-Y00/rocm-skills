@@ -71,3 +71,18 @@ its own backend choice. Numerical rules: [`knowledge/numerics/batch-invariance.m
   gave different output bits; rows-only or columns-only launches all agreed; LSE always agreed.
 - Takeaway: enforce `num_warps <= BLOCK_M / 16` when `BLOCK_M > 16` if decode and training must match.
 - Applicability: any Triton attention forward that must be batch-invariant on gfx950.
+
+### 2026-11-19 — visibility intervals, sinks, pruned backward
+- Context: per-token visibility [lo, hi] in global key indices (kernel subtracts the sequence's first
+  key), per-head sinks folded after all keys, Hq=32, Hkv=8, D=128, bf16, Triton 3.9.
+- Signal: decode with a causal mask given as intervals: +0-5% vs the built-in causal path, once the
+  paged key starts (exclusive cumsum of seq_lens) are cached on the mask. Computing them per call
+  added two small launches, +14% at batch 1 x 4k (57 -> 65 us). Training fwd with intervals +25%
+  vs built-in causal (8x4096: 2.57 -> 3.21 ms). Pruning the backward (per KV tile first/last query
+  row for dK/dV, per query block key range for dQ) took fwd+bwd from 2.3x to 1.2x of built-in.
+- Rejected: splitting the tile loop to skip the interval mask on tiles every row fully sees (exact
+  identity, same bits) made the training forward about 2x slower (3.21 -> 4.93 ms), likely from
+  four inlined copies of the tile body. One masked loop plus a masked last tile is faster.
+- Takeaway: per-step mask metadata belongs on the mask object (one computation per step, reused by
+  all layers); do not add loop variants for mask elision in Triton attention without measuring.
+- Applicability: masked/varlen Triton attention on gfx950 that must stay batch invariant.
