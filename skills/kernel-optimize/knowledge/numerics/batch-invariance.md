@@ -126,14 +126,12 @@ without wasting rows, so pick the slimmest MFMA that prefill still runs near pea
 
 FlashAttention kernels that skip the accumulator rescale until the running max grows past a margin
 must make that decision **per row**. The gfx950 FlyDSL dual-wave forward (FlyDSL
-`kernels/attention/flash_attn_gfx950.py`, and its copies in Primus-Turbo
-`primus_turbo/flydsl/attention/flash_attn_fwd.py` and MSLK `mslk/attention/flydsl/flash_attn_gfx950.py`)
-fires the rebase **wave-uniformly** (`_wave_any` / ballot over the 32 rows of a wave), then rebases
+`kernels/attention/flash_attn_gfx950.py`, and its copy in Primus-Turbo
+`primus_turbo/flydsl/attention/flash_attn_fwd.py`) fires the rebase **wave-uniformly** (`_wave_any` / ballot over the 32 rows of a wave), then rebases
 every row of the wave. A row's reference, and so its exp2 inputs and QK seed, depends on which rows
 share its wave: 31 neighbors in a full prefill, none in a decode step, others in a chunked prefill.
 Fix: per-row trigger, unconditional accumulator multiply (factor exactly 1.0 when the row did not
-fire). MSLK's `dualwave_swp_lazy_rescale=False` path (`rescale_o` every tile) is a ready per-row
-variant to measure the cost against.
+fire).
 
 ## KV blocks must be accumulated in increasing absolute key position
 
@@ -153,12 +151,16 @@ breaks even when every visible block is visited:
 
 ## Library audit (what breaks invariance, by library)
 
+Code sources for new kernels: Primus-Turbo, FlyDSL and aiter only. Do not read or reuse third-party
+kernel libraries that carry their own copies of FlyDSL attention (for example Meta's MSLK) when
+writing FlyDSL kernels.
+
+
 | Library / kernel | Status | Findings |
 |---|---|---|
 | aiter `unified_attention` (Triton and Gluon) | Measured on MI355X (aiter in `rocm/primus:v26.5`) | Decode alone vs batched 8/64: differs (up to 2e-3, bf16); prefill vs decode and chunked prefill: differ (~1e-3 / 4e-3); with a window, batched decode matched (always 2D). Causes: 2D vs split-KV 3D chosen by `max_seqlen_k <= 512` or program count vs 4x CUs; `NUM_SEGMENTS` from the batch with segments relative to each sequence; per-bucket tile and MFMA; running max reset to 0 after a fully masked tile |
 | FlexAttention | Code-read, torch 2.8.0 | Query length < 128 switches to the flex-decoding kernel; its `SPLIT_KV = num_CUs // (batch * kv_heads) * 2`, split length `cdiv(KV_LEN, SPLIT_KV)`; `max_autotune` tunes block sizes per shape; partial-before-full block order (above). Keeps the running max at -inf (good). Can be made invariant across other sequences with `kernel_options` (`FORCE_USE_FLEX_ATTENTION=True`, fixed block sizes, no autotune), at the cost of decode speed |
 | FlyDSL gfx950 dual-wave forward (Primus-Turbo `fce86ab`) | Code-read | Wave-uniform lazy rescale (above); D <= 64 score bound computed with `k_sq_norm_max(k, 8)` over the whole packed K tensor (depends on other sequences); `cross_seqlen` build flag chosen from batch max lengths; dispatcher only selects FlyDSL for uniform lengths (`_uniform_cu_seqlens`), else aiter; no split-K in the forward |
-| MSLK FlyDSL (`0ccfd55`) | Code-read | Same lazy rescale; prefill `num_kv_splits` from a CK-ported batch/CU heuristic with splits relative to each sequence; in-workgroup `merge_wave_splitk`; dense routing between dual-wave and generic kernels by batch and length (`_dense_routes_to_dualwave`); decode kernels use 16x16x32 MFMA and 32-key tiles (prefill: 32x32x16, 64-key) with `auto_split_k_hp` from batch/CUs and a wave-butterfly merge whose order depends on the partition count |
 | SGLang Triton backend, deterministic mode | Code-read, `sglang-miles` `3f7c4f02` | Extend/prefill uses the 1-stage `extend_attention_fwd_unified`; decode uses `decode_attention_fwd` with fixed-tile split-KV (`num_kv_splits = ceil(seq_len / split_tile_size)`). Deterministic and batch-invariant, but decode is a different kernel from prefill |
 
 ## Two contracts for train/infer match
@@ -185,9 +187,6 @@ The backward never has to match inference, only be deterministic. Still note:
   (`ceil(Skv / block_kv)`) and dK/dV `q_split` (up to 4; 1 with a window; dispatch-width based on the
   ragged path) depend on shape, so gradients for a sequence can differ in the last bits when it is
   packed differently. Make them per-model constants if packing-invariant gradients are required.
-- MSLK's FlyDSL backward is deterministic on gfx950 under `torch.use_deterministic_algorithms`
-  (per-tile dQ workspace, fixed-order reduction); it supports varlen block-diagonal masks but no
-  attention sink and no paged/gappy backward.
 - Shared-prefix (paged) training needs a backward that sums the prompt's dK/dV over N responses in a
   fixed order, never with atomics. None of the libraries above has it.
 
