@@ -129,3 +129,17 @@ for the same op: [`../triton/tips.md`](../triton/tips.md). Numerical rules:
   bit that matters (sc0 alone: nothing). 64 x 4k 239 -> 174 us, 32 x 32k 827 -> 722, 8 x 128k
   884 -> 781. Plus a sequence-major grid (x = sequences, not KV heads): another 1-4% at long context.
 - Takeaway: for read-once streams on gfx950, set nt on the loads before tuning the pipeline.
+
+### 2026-11-21 — reproducing aiter's gfx950 decode (rounds 20-21, rolled back)
+- aiter `unified_attention` on gfx950 runs a Gluon kernel for decode: `num_warps=1`, 128 VGPR,
+  2 K / V LDS buffers (68 KiB, 2 workgroups per CU), every K / V DMA `sc0 nt`, partial vmcnt waits
+  (QK of a tile before its V lands), 4096-key segments. 4 x 128k: 339 us vs FlyDSL 393, Triton 369.
+- Our port as a FlyDSL one-wave split program (16 rows, double-buffered async nt DMAs, fenced waits,
+  4-8 segments per program) was bitwise equal and had the intended instruction order, but only at
+  parity with the dual-wave pipelined kernel (+-2%); with one segment per program it was 8-15% slower.
+- Pitfalls hit on the way: raw-DMA descriptor in VGPRs (160 waterfall loops; readfirstlane fixes),
+  backend vmcnt(0) before LDS reads (async LDS DMA fixes), LDS reads hoisted above the waits
+  (sched_barrier(0) fixes), raw async op wants MLIR values and an IntegerAttr aux.
+- Takeaway: matching aiter's structure was not enough; at 2 waves per CU the remaining 5-25% is
+  per-tile instruction cost, here partly the bitwise contract's (MFMA row sum, exp2 clamp, exact
+  per-row rebase, visibility checks). Measure the per-tile mix before restructuring.

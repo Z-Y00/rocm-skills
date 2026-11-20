@@ -53,6 +53,9 @@ Bypass the VGPR detour so registers stay free for accumulators.
 - **Direct-to-LDS loads.** `buffer_load_lds` / `raw_ptr_buffer_load_lds` stream device memory straight into LDS without a register round-trip — the backbone of double-buffered prologues; it reclaims the VGPRs an A-tile would otherwise occupy. The cooperative form issues per wave/lane with an XOR-swizzled destination so the subsequent MFMA / transpose-read is conflict-free, gated by an `s_waitcnt(0)` + `gpu.barrier()` per consumer batch.
 - **Mind the per-arch granularity.** gfx942 async copy moves **4 B/op**, gfx950 **16 B/op**. On gfx942 the per-issue cost can exceed the savings for small tiles — reserve async copy for large `tile_m` (≥ 128); on gfx950 it is profitable more broadly.
 - **Gate precisely.** A compile-time-known load count lets `s_waitcnt(num_loads)` gate exactly the loads the next consumer needs instead of a blanket `s_waitcnt 0`; if the count is dynamic the gate cannot be precise.
+- **Cache policy on streamed-once data.** The LDS-DMA copy atom (`BufferCopyLDS128b`) has no cache-policy field; for data read once (decode K / V) issue `rocdl.raw_ptr_buffer_load_lds(rsrc, lds_ptr, size, voffset, soffset, offset, aux)` with `aux = 3` (gfx950 `sc0 nt`, what Triton emits for `.cg`). `nt` is the bit that matters: a load-bound decode got 10-28% faster (64x4k 239 -> 174 us). Check the ISA for `nt` on the `buffer_load ... lds` lines.
+- **Keep raw descriptors uniform.** A descriptor built from a computed base (`create_buffer_resource_from_addr`) can land in VGPRs; the backend then wraps every DMA in a waterfall loop (`v_readfirstlane` + `s_cbranch_execnz` per load). `rocdl.readfirstlane` on the base and size removes them. Count `s_cbranch_execnz` in the ISA.
+- **Raw DMAs and backend waits.** Raw LDS DMAs carry no LDS alias information, so the backend may insert `vmcnt(0)` before LDS reads of a different buffer (killing double buffering); alias scopes on the DMA did not help. `rocdl.raw_ptr_buffer_load_async_lds` (operands as MLIR values, `aux` as an `IntegerAttr`) with `rocdl.asyncmark()` per group and `rocdl.wait_asyncmark(n)` removes those waits; fence each wait with `sched_barrier(0)` or the scheduler hoists the LDS reads above it.
 - **Port raw `buffer_ops` to the layout API** when you want this cleanly: `make_buffer_tensor` + `logical_divide` + `copy_atom_call` with a `BufferCopy*b` atom replaces manual byte arithmetic / `shrui(...,2)` / i32→dtype bitcasts. Two caveats: `copy_atom_call` has no `mask=`, so re-introduce explicit `is_valid.select(...)` / `if is_valid:` OOB guards; and a wave-uniform row offset may currently fold into voffset (VGPR) rather than soffset (SGPR), so re-check VGPR pressure after porting.
 
 ## 6. Hot-Loop Instruction Scheduling
@@ -152,6 +155,13 @@ For intra-node multi-GPU collectives in the small/medium-message regime where a 
 - **Keep launch facades torch-agnostic.** A small dtype-string table (dtype → MLIR type / vec width / byte size) plus a `TensorView` over swappable load/store impls keeps kernel callsites from branching on `torch.dtype`; cache the compiled function on the kernel object so the first call compiles+runs and later calls fast-dispatch. Extend the dtype table when adding a dtype rather than handling it at the callsite (it silently returns `None` otherwise).
 
 ---
+
+## 16. Diagnosing Memory-Bound Kernels
+
+- **Per-launch GPU time first.** For multi-launch ops time each kernel (`torch.profiler` device events; `rocprofv3` may abort with PyTorch loaded). A split-KV decode's slow launch was the merge (102 vs 9 us), not the streaming kernel.
+- **Bound it with probe builds.** Compile throwaway variants that skip the compute (loads only) or the loads (compute on stale LDS). If loads-only is as slow as the full kernel, tune the load path (cache bits, launch order, descriptors), not the pipeline or occupancy.
+- **Launch order.** Consecutive workgroups reading the same DRAM rows (e.g. the KV heads of one sequence) cost a few %; a grid whose fastest axis spreads concurrent workgroups over sequences gained 1-6% at long context.
+- **Program length.** A one-wave program at 2 workgroups per CU pays its prologue (loads, pipeline fill, partial stores) per program; 16-tile programs were 8-15% slower than 64-tile ones.
 
 ## Training-Transfer Guardrails
 
