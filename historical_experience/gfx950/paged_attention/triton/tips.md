@@ -107,3 +107,20 @@ its own backend choice. Numerical rules: [`knowledge/numerics/batch-invariance.m
   log2(e)/sqrt(D) and rounds it to bf16 before the QK MFMA, which perturbs large logits by units.
   It does not affect train/infer match (both sides round the same) but is worth knowing.
 - Applicability: any lazily rescaled online softmax with wave- or block-uniform triggers.
+
+### 2026-11-19 — FlyDSL RL forward: split-KV with in-kernel segment merge
+- Context: bitwise-invariant split-KV decode needs the training forward to reduce the same fixed
+  absolute KV segments and merge them in the same order. Implemented in the FlyDSL dual-wave fork as
+  an outer (reference, row sum, accumulator) state carried through the pipelined loop, merged at
+  segment boundaries; decode runs one program per segment plus a merge launch of the same kernel.
+- Signal: correct on the first try once (a) the segment's first tile is scored without the previous
+  reference shift (as a fresh program's prologue does) and (b) the merge uses plain IEEE ops (no
+  fast-math), so two kernels cannot fuse it differently. Cost is register pressure, not merges:
+  D=128 training fwd +68% at 2 waves/SIMD + 128-row blocks, +32% at 1 wave/SIMD + 64-row blocks;
+  D=64 +11%; segment length (16 vs 32 tiles) changed nothing. Packed decode with segments: +100% at
+  128/2, ~+5% at 64/1. Long prefill +53%.
+- Gain: Llama-3-8B decode 1x32k 1010 -> 125 us, 1x4k 133 -> 60 us (aiter 67).
+- Also: per-call host work (cumsum, interval and group-bound kernels) dominated short decode kernels
+  (GPT-OSS decode 71 -> 14 us after caching it per step on tensor identity + version).
+- Takeaway: for invariant split-KV, budget the outer accumulator's registers up front; try 1 wave/SIMD
+  and smaller blocks before restructuring; keep segment merges in exact arithmetic.
