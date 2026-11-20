@@ -92,3 +92,15 @@ for the same op: [`../triton/tips.md`](../triton/tips.md). Numerical rules:
 - Also: a one-tile loop over the same rl_attn_helper calls, in the pipelined kernel's per-row order
   (QK seeded with the previous reference, mask, rebase, exp2, MFMA row sum, P*V), reproduces the
   pipelined kernel's bits exactly; skipped dead 32-column halves equal computed-then-masked ones.
+
+### 2026-11-20 — split decode: real-row partials, merge pieces, MFMA shape and bits
+- Signal: storing / loading split partials only for rows of a real token (packed decode fills 4 of 64
+  rows; masked buffer ops need a descriptor bounded to the program's slot, or the redirected offset
+  lands in memory) cut workspace traffic 16x: 32x32k 1062 -> 899 us, merge at 32x128k 430 -> 81 us.
+  Merging 8-float pieces with 16 segments in flight: merge 1x512k 273 -> 111 us. Segments per split
+  program (up to 8, >= 4 programs per CU) now pays: 32x32k 901 -> 819 us.
+- Signal: bf16 -> fp32 MFMA chains with 16x16x16, 16x16x32 and 32x32x16 instructions (Triton
+  `matrix_instr_nonkdim` 16 / 32, k-steps 16-128) gave identical bits on M 32-64, N 64-128,
+  K 64-128, inputs at scale 1 and 30 (instructions confirmed in the ISA).
+- Takeaway: a decode build may use 16-row MFMA tiles and still match a 32x32x16 training forward,
+  if verified bitwise (re-check on adversarial inputs before relying on it).
