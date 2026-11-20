@@ -3,7 +3,7 @@
 Kernel: OneTensor `onetensor/kernels/attention_fwd.py`, derived from aiter's
 `kernel_unified_attention_2d/3d` + `reduce_segments`, with fixed absolute KV segments and a fused
 mode (2D kernel with a segment loop). Shapes below: Hq=32, Hkv=8, D=128, bf16, page 16, MI355X,
-Triton 3.8. Baseline "aiter" = `aiter.ops.triton.attention.unified_attention.unified_attention` with
+Triton 3.8. FlyDSL tips for the same op: [`../flydsl/tips.md`](../flydsl/tips.md). Baseline "aiter" = `aiter.ops.triton.attention.unified_attention.unified_attention` with
 its own backend choice. Numerical rules: [`knowledge/numerics/batch-invariance.md`](../../../../skills/kernel-optimize/knowledge/numerics/batch-invariance.md).
 
 ### 2026-11-10 — first-pass defaults vs aiter
@@ -87,52 +87,16 @@ its own backend choice. Numerical rules: [`knowledge/numerics/batch-invariance.m
   all layers); do not add loop variants for mask elision in Triton attention without measuring.
 - Applicability: masked/varlen Triton attention on gfx950 that must stay batch invariant.
 
-### 2026-11-19 — FlyDSL dual-wave forward (Turbo gfx950): what breaks invariance, and the fix
-- Context: Primus-Turbo's FlyDSL dual-wave software-pipelined forward (flash_attn_fwd_stock.py),
-  Hq=32/64, Hkv=8, D=128/64, bf16, MI355X, FlyDSL 0.3.4.1. Probed bitwise: alone vs packed ragged,
-  block_m 64 vs 128, and chunked prefill (512/37 tokens) and single-row decode vs the training forward.
-- Signal: batch composition and launch shape were already invariant. With random inputs every
-  check passed too, because the lazy rescale (reference = row max + 96) never fired. With key norms
-  growing along the sequence (so it fires), D=128 chunked prefill / decode differed from training
-  by 100-2000 elements per chunk; with a 128-key window it differed even on random data (leading
-  masked tiles). Cause: the rebase branch is wave-uniform and inside it every row with a tile max
-  within 96 of its reference rebased, so a row's bits depended on which rows shared its wave.
-- Fix (accepted): keep the wave-uniform branch but select per row: rows whose own tile max did not
-  outrun their own reference take shift 0 / rescale 1 / reference kept (exact identities). All
-  chunk/decode diffs went to 0 for D=64/128 with and without window; forward time -1.8 to +2.4%.
-  Also turn off the D<=64 Cauchy-Schwarz score bound: it is computed over the whole packed K tensor
-  and floors masked prologue rows, so it can make a row depend on other sequences.
-- Accuracy note: with large logits (hundreds) the FlyDSL forward's max error vs fp32 was 0.15-1.2
-  while the Triton kernel stayed at 0.015 (both 0.009 on normal-scale data). FlyDSL pre-scales Q by
-  log2(e)/sqrt(D) and rounds it to bf16 before the QK MFMA, which perturbs large logits by units.
-  It does not affect train/infer match (both sides round the same) but is worth knowing.
-- Applicability: any lazily rescaled online softmax with wave- or block-uniform triggers.
-
-### 2026-11-19 — FlyDSL RL forward: split-KV with in-kernel segment merge
-- Context: bitwise-invariant split-KV decode needs the training forward to reduce the same fixed
-  absolute KV segments and merge them in the same order. Implemented in the FlyDSL dual-wave fork as
-  an outer (reference, row sum, accumulator) state carried through the pipelined loop, merged at
-  segment boundaries; decode runs one program per segment plus a merge launch of the same kernel.
-- Signal: correct on the first try once (a) the segment's first tile is scored without the previous
-  reference shift (as a fresh program's prologue does) and (b) the merge uses plain IEEE ops (no
-  fast-math), so two kernels cannot fuse it differently. Cost is register pressure, not merges:
-  D=128 training fwd +68% at 2 waves/SIMD + 128-row blocks, +32% at 1 wave/SIMD + 64-row blocks;
-  D=64 +11%; segment length (16 vs 32 tiles) changed nothing. Packed decode with segments: +100% at
-  128/2, ~+5% at 64/1. Long prefill +53%.
-- Gain: Llama-3-8B decode 1x32k 1010 -> 125 us, 1x4k 133 -> 60 us (aiter 67).
-- Also: per-call host work (cumsum, interval and group-bound kernels) dominated short decode kernels
-  (GPT-OSS decode 71 -> 14 us after caching it per step on tensor identity + version).
-- Takeaway: for invariant split-KV, budget the outer accumulator's registers up front; try 1 wave/SIMD
-  and smaller blocks before restructuring; keep segment merges in exact arithmetic.
-
-### 2026-11-19 — FlyDSL: read register use from the compiler, not from timings
-- How: `FLYDSL_DUMP_IR=1 FLYDSL_DEBUG_DUMP_ASM=1 FLYDSL_DUMP_DIR=<dir>` (both needed), then
-  `.vgpr_count`, `.agpr_count`, `.vgpr_spill_count`, `.private_segment_fixed_size`,
-  `.group_segment_fixed_size` in `<dir>/**/15_final_isa.s`. Compile-only (`module.compile(...)`) is
-  enough; use a fresh `FLYDSL_RUNTIME_CACHE_DIR` so it actually compiles. rocprofv3 kernel trace
-  aborted in rocm/primus:v26.9 with PyTorch loaded ("api registration ... outside of valid
-  rocprofiler configuration period").
-- Signal (RL fork, D=128): stock 230 VGPR; fp32 score scaling 250 (no spill, same 2 waves);
-  segments at 2 waves: 256 + 46 spilled (+68%); at 1 wave / 64-row blocks: 300 VGPR + 44 AGPR, no
-  spill (+32%, from occupancy). D=64: 150 / 170 / 200, never spills. LDS: 68 KB (D=128), 34 KB (D=64).
-- Correction: an earlier tip assumed the D=128 kernel used 34 KB LDS; it is 68 KB.
+### 2026-11-20 — Primus-Turbo RL attention: schedule sweep with a bit check (does not change bits)
+- Context: Primus-Turbo's port (`rl_attention_triton_impl.py`), Triton 3.9, MI355X, llama3-8b /
+  qwen3-32b (D=128) and gpt-oss-120b (D=64, window 128, sinks). Swept MODE, BLOCK_M, num_warps,
+  num_stages, waves_per_eu one at a time (`benchmark/ops/training/tune_rl_attention.py`), keeping only
+  candidates bitwise equal to the default schedule; none was rejected for bits.
+- Signal: (1) 1024+ query tokens at D=128 with 256-row blocks were 1.4-2.9x slower than 128 rows:
+  training fwd 8x4096 2.56 -> 1.65 ms, prefill 2048 on 16k 2.0 -> 0.79 ms; 64 rows within ~4% of 128;
+  at D=64 (gpt-oss) 256 stays fastest. (2) Sliding-window decode under MODE=auto split over every
+  segment of the context, though the window reads at most two: fused was 1.7x faster (75 -> 44 us).
+- Takeaway: the 2026-11-10 "BLOCK_M 128-256 for prefill" result does not carry over to this kernel
+  with masks / sinks / intervals at long queries: cap at 128 for D >= 128. Count segments over the
+  keys actually read (window + query length), not over the context, when choosing split-KV.
+- Applicability: gfx950 Triton attention forward with windows; any split-vs-fused heuristic.
