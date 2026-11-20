@@ -35,7 +35,7 @@ New in this repo:
   how to keep a kernel bitwise stable across batch shapes and between inference and training
   (aligned split-K / split-KV, split vs fused modes, exact online-softmax no-ops, masked loads, and
   the measured gfx950 rule that launch layouts with warps on both tile axes change bits).
-- [`skills/kernel-optimize/knowledge/backend/triton/pitfalls.md`](skills/kernel-optimize/knowledge/backend/triton/pitfalls.md)
+- [`skills/kernel-optimize/knowledge/backend/triton/`](skills/kernel-optimize/knowledge/backend/triton/overview.md) (overview, optimization directions, pitfalls)
   and the gfx950 paged-attention tips (`historical_experience/gfx950/paged_attention/triton/`).
 
 To use the skills from a project while still editing them, add this repo as a git submodule and
