@@ -124,3 +124,15 @@ its own backend choice. Numerical rules: [`knowledge/numerics/batch-invariance.m
   (GPT-OSS decode 71 -> 14 us after caching it per step on tensor identity + version).
 - Takeaway: for invariant split-KV, budget the outer accumulator's registers up front; try 1 wave/SIMD
   and smaller blocks before restructuring; keep segment merges in exact arithmetic.
+
+### 2026-11-19 — FlyDSL: read register use from the compiler, not from timings
+- How: `FLYDSL_DUMP_IR=1 FLYDSL_DEBUG_DUMP_ASM=1 FLYDSL_DUMP_DIR=<dir>` (both needed), then
+  `.vgpr_count`, `.agpr_count`, `.vgpr_spill_count`, `.private_segment_fixed_size`,
+  `.group_segment_fixed_size` in `<dir>/**/15_final_isa.s`. Compile-only (`module.compile(...)`) is
+  enough; use a fresh `FLYDSL_RUNTIME_CACHE_DIR` so it actually compiles. rocprofv3 kernel trace
+  aborted in rocm/primus:v26.9 with PyTorch loaded ("api registration ... outside of valid
+  rocprofiler configuration period").
+- Signal (RL fork, D=128): stock 230 VGPR; fp32 score scaling 250 (no spill, same 2 waves);
+  segments at 2 waves: 256 + 46 spilled (+68%); at 1 wave / 64-row blocks: 300 VGPR + 44 AGPR, no
+  spill (+32%, from occupancy). D=64: 150 / 170 / 200, never spills. LDS: 68 KB (D=128), 34 KB (D=64).
+- Correction: an earlier tip assumed the D=128 kernel used 34 KB LDS; it is 68 KB.
