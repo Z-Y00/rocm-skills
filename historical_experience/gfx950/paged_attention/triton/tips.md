@@ -86,3 +86,24 @@ its own backend choice. Numerical rules: [`knowledge/numerics/batch-invariance.m
 - Takeaway: per-step mask metadata belongs on the mask object (one computation per step, reused by
   all layers); do not add loop variants for mask elision in Triton attention without measuring.
 - Applicability: masked/varlen Triton attention on gfx950 that must stay batch invariant.
+
+### 2026-11-19 — FlyDSL dual-wave forward (Turbo gfx950): what breaks invariance, and the fix
+- Context: Primus-Turbo's FlyDSL dual-wave software-pipelined forward (flash_attn_fwd_stock.py),
+  Hq=32/64, Hkv=8, D=128/64, bf16, MI355X, FlyDSL 0.3.4.1. Probed bitwise: alone vs packed ragged,
+  block_m 64 vs 128, and chunked prefill (512/37 tokens) and single-row decode vs the training forward.
+- Signal: batch composition and launch shape were already invariant. With random inputs every
+  check passed too, because the lazy rescale (reference = row max + 96) never fired. With key norms
+  growing along the sequence (so it fires), D=128 chunked prefill / decode differed from training
+  by 100-2000 elements per chunk; with a 128-key window it differed even on random data (leading
+  masked tiles). Cause: the rebase branch is wave-uniform and inside it every row with a tile max
+  within 96 of its reference rebased, so a row's bits depended on which rows shared its wave.
+- Fix (accepted): keep the wave-uniform branch but select per row: rows whose own tile max did not
+  outrun their own reference take shift 0 / rescale 1 / reference kept (exact identities). All
+  chunk/decode diffs went to 0 for D=64/128 with and without window; forward time -1.8 to +2.4%.
+  Also turn off the D<=64 Cauchy-Schwarz score bound: it is computed over the whole packed K tensor
+  and floors masked prologue rows, so it can make a row depend on other sequences.
+- Accuracy note: with large logits (hundreds) the FlyDSL forward's max error vs fp32 was 0.15-1.2
+  while the Triton kernel stayed at 0.015 (both 0.009 on normal-scale data). FlyDSL pre-scales Q by
+  log2(e)/sqrt(D) and rounds it to bf16 before the QK MFMA, which perturbs large logits by units.
+  It does not affect train/infer match (both sides round the same) but is worth knowing.
+- Applicability: any lazily rescaled online softmax with wave- or block-uniform triggers.
