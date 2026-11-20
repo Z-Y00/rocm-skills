@@ -118,3 +118,14 @@ for the same op: [`../triton/tips.md`](../triton/tips.md). Numerical rules:
   unchanged. Decode -6% geomean, training forward +2-6%.
 - Takeaway: on gfx950 the MFMA shape is free for bits if the k sequence is kept; the decode limit
   after that is LDS per workgroup, not registers or dead rows.
+
+### 2026-11-20 — streaming decode: non-temporal loads and launch order
+- Diagnosis method: loads-only and compute-only probe builds of the decode loop (skip the QK / P*V
+  or skip the DMAs) showed loads alone took the whole kernel time (815 of 831 us at 8 x 128k).
+  Changing the load instruction (LDS DMA vs register + ds_write), the per-instruction access
+  (8 half-rows vs 4 full 256 B rows), LDS occupancy and paging did nothing.
+- Fix: issue paged K / V with `rocdl.raw_ptr_buffer_load_lds(..., aux=3)` (gfx950 sc0 | nt, what
+  Triton emits for `.cg`); the copy atom `BufferCopyLDS128b` has no cache-policy field. nt is the
+  bit that matters (sc0 alone: nothing). 64 x 4k 239 -> 174 us, 32 x 32k 827 -> 722, 8 x 128k
+  884 -> 781. Plus a sequence-major grid (x = sequences, not KV heads): another 1-4% at long context.
+- Takeaway: for read-once streams on gfx950, set nt on the loads before tuning the pipeline.
