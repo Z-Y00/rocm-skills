@@ -77,3 +77,18 @@ for the same op: [`../triton/tips.md`](../triton/tips.md). Numerical rules:
 - Noise: GPT-OSS decode rows (~45-55 us, host-bound) moved +-15% between nodes for unchanged code;
   re-run before a decision that hinges on them.
 - Applicability: FlyDSL / any gfx950 split-KV decode with a heavy per-row state.
+
+### 2026-11-20 — split decode: the merge launch, not the streaming programs
+- Context: llama3 decode 8 x 32k / 1 x 32k, FlyDSL split programs + MERGE launch vs Triton split +
+  reduce; per-kernel GPU times from `torch.profiler` (rocprofv3 aborts with PyTorch in rocm/primus).
+- Signal: MERGE 102 / 69 us vs Triton reduce 9 / 6 us; split programs 232 vs 183 us. Three new split
+  program builds (one 34 KiB buffer: 4 workgroups per CU; register-staged K/V: 65 VGPR spilled; one
+  buffer with early release) were all bitwise equal to training and none faster. Merging one
+  16-float accumulator chunk per program (grid x KV heads x 4) with 8 segments' loads in flight:
+  MERGE 29 / 17 us; decode 8x32k 373 -> 297 us, 1x32k 129 -> 77 us, bits unchanged.
+- Takeaway: a sequential merge over segments must not load-then-merge per segment; the merge is
+  elementwise, so split it by accumulator chunk and keep many segments' loads in flight. Profile
+  each launch before tuning the one you assume is slow.
+- Also: a one-tile loop over the same rl_attn_helper calls, in the pipelined kernel's per-row order
+  (QK seeded with the previous reference, mask, rebase, exp2, MFMA row sum, P*V), reproduces the
+  pipelined kernel's bits exactly; skipped dead 32-column halves equal computed-then-masked ones.

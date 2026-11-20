@@ -87,8 +87,14 @@ math, both bitwise equal to their own training forward. Triton 195 us, FlyDSL du
 | Workgroups per CU | 4 | 2 (LDS bound) |
 | K / V bytes in flight per CU | ~4 x 32 KiB | ~2 x 32 KiB |
 
-Decode streams K / V once, so bandwidth follows bytes in flight per CU (Little's law), not MFMA
-efficiency or in-workgroup pipelining. Triton gets there with a small footprint (one reused LDS tile,
-no pipeline) and many workgroups; the FlyDSL kernel's deep in-workgroup pipeline costs LDS that caps
-it at 2 workgroups. Freeing registers in the FlyDSL kernel (312 -> 254 VGPR) changed nothing,
-because LDS, not registers, set the occupancy.
+The static comparison suggests bytes in flight per CU (Little's law) explain the gap. Measured,
+they did not: a FlyDSL build with one 34 KiB buffer (4 workgroups per CU, loads overlapping compute)
+was no faster. Per-kernel GPU times (`torch.profiler`) showed most of the gap in the second launch:
+the FlyDSL merge of the split partials took 102 us against Triton's 9 us reduce, because each lane
+loaded one segment, merged it, then loaded the next (32 dependent round trips), while Triton's reduce
+issues every segment's loads at once and merges in registers. The streaming split programs were only
+1.3x apart (232 vs 183 us). Merging one accumulator chunk per program with 8 segments' loads in
+flight took the FlyDSL merge to 29 us.
+
+Lesson: compare per-kernel GPU times before reasoning from compiled resources; a multi-launch op's
+end-to-end time hides which launch is slow.
