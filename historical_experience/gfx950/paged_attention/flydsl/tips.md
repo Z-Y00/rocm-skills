@@ -104,3 +104,17 @@ for the same op: [`../triton/tips.md`](../triton/tips.md). Numerical rules:
   K 64-128, inputs at scale 1 and 30 (instructions confirmed in the ISA).
 - Takeaway: a decode build may use 16-row MFMA tiles and still match a 32x32x16 training forward,
   if verified bitwise (re-check on adversarial inputs before relying on it).
+
+### 2026-11-20 — 16 rows per wave in the dual-wave forward, bitwise equal to 32
+- Change: ROWS_PER_WAVE trait. 16x16x32 QK with K rows loaded in key order
+  4 (q % 2) + 16 (q // 2) + 8 t + lane % 4 (q = (lane % 16) // 4, t = tile in the 32-key half), so
+  each lane's 16x16 scores are exactly the P values the 16x16x32 P*V B operand needs, in the
+  32-row build's key sequence; V transposed reads reuse the 32-row per-lane addresses of the same
+  aligned 16-lane group (lane (g % 2) 32 + (tile % 2) 16 + n, substep 2 half + g // 2); row max over
+  lanes n, n + 16, n + 32, n + 48 (permlane32 + permlane16 swaps); row sum as 4 MFMAs (k-slots 0-15
+  / 16-31 of the low / high half) in the 32-row key order.
+- Signal: bitwise equal to the 32-row build on training (D 128 / 64, windows, sinks, segments),
+  prefill, fused and split decode, and the full suite. VGPR 300-311 + 44-55 AGPR -> 178-196, LDS
+  unchanged. Decode -6% geomean, training forward +2-6%.
+- Takeaway: on gfx950 the MFMA shape is free for bits if the k sequence is kept; the decode limit
+  after that is LDS per workgroup, not registers or dead rows.
