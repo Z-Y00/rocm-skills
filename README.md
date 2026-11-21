@@ -16,6 +16,7 @@ the training-step throughput went from 317 to 912 TFLOPS.
 | `rules/iteration_rules.mdc` | Hard rules for a campaign: one variable per round, correctness first, full validation, accept/rollback lineage, gains must transfer to a real training step |
 | `skills/kernel-optimize/` | The optimization loop, plus a knowledge base by op (`gemm`, `attention`), hardware (`gfx942`, `gfx950`, `gfx1250`), backend (`flydsl`, `triton`) and numerics (batch invariance) |
 | `skills/primus-turbo-develop/` | Primus-Turbo project skill: architecture, accuracy and performance verification, profiling, handoff to `kernel-optimize`. It is an example of the project-skill contract that `kernel-optimize` expects |
+| `skills/rccl-sdma/` | Running, verifying and measuring RCCL copy-engine (SDMA) collectives on MI355X: how RCCL picks the copy-engine path, Primus switches for Megatron, TorchTitan and Flux, multi-node settings, proving the copy engines ran, measurement method, debugging hangs, and building RCCL from a PR into the training image |
 | `historical_experience/gfx1250/sparse_mla_fwd_bwd/flydsl/` | `tips.md` (per-round signal / takeaway entries) and `lessons_learned.md` (campaign retrospective) |
 | `historical_experience/gfx950/paged_attention/triton/` | `tips.md` from the OneTensor batch-invariant paged attention work on MI355X |
 | `tools/` | ISA analysis helpers for FlyDSL IR dumps: `isa_loop_hist.py` (hot-loop mnemonic histogram and diff), `isa_seq.py` (run-length op sequence) |
