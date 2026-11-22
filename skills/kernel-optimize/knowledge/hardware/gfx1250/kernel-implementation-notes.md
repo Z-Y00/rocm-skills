@@ -152,6 +152,20 @@ that found it, so it can be re-checked on a new compiler.
   from one lane (others store to an OOB offset), split prologue / loop / epilogue cheaply. The
   counter is per SIMD: compare durations, not start times. Stamps do not fence VALU, so sub-phase
   stamps inside arithmetic are unreliable.
+- **Clock from in-kernel counters.** On gfx1250 `llvm.readcyclecounter` lowers to the 64-bit
+  `s_get_shader_cycles_u64` and `llvm.readsteadycounter` to `s_sendmsg_rtn_b64
+  MSG_RTN_GET_REALTIME` (constant rate). Shader cycles / real-time ticks × the real-time rate
+  (measured against host time over the kernel's span: earliest start to latest end across waves,
+  with all waves resident from launch) gives the clock the waves actually ran at, with no
+  hardware constant. A pure WMMA loop measured this way matched the driver's per-XCD SCLK to
+  well under 1 %.
+- **The clock depends on the load.** A matrix-only loop held a noticeably higher SCLK than a
+  library GEMM on the same part (less power per cycle): a clock measured on a microbenchmark is
+  not the clock a real GEMM sees. Settle on the counter itself before timing; the driver's clock
+  metric lags a load change and read several % high right after a switch.
+- **Vendor low-precision GEMMs can be slower than bf16** on a young software stack (the library
+  picked small tiles for fp8 / MX at large shapes). Check the kernel trace before using one as a
+  roofline or for any per-precision calibration.
 - **Ablate by deleting work, timing only.** Patched copies that drop a stream or a phase bound
   what it can be worth. Pitfalls: removing a result store lets the compiler drop every WMMA that
   fed it (store to an OOB offset instead); a gather where every slot reads one row becomes an L2

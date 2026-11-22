@@ -89,12 +89,16 @@ Each of these produces a silent wrong result, a hang, or a dropped optimization 
 | Apply XOR swizzle identically on every LDS write and read. | Asymmetric swizzle reads the wrong rows with no compiler signal — the most common LDS corruption. |
 | Rotate ping-pong buffers (and any parity flag) every iteration. | Forgetting one swap reads stale LDS the next iteration; invisible at compile time. |
 | Out-of-range GPR/LDS access on CDNA3 does **not** fault. | An over-indexed read returns 0 / register 0; a budgeting bug looks like a numerical bug. |
+| No `from __future__ import annotations` in a file that defines `@flyc.jit` / `@flyc.kernel`. | FlyDSL reads the annotations at runtime; postponed (string) annotations turn `Constexpr[int]` into a runtime value, failing with e.g. `known_block_size[0] must be an int, got ArithValue`. |
+| Torch tensors arrive as `fx.Tensor` (a memref): take the pointer with `fx.get_iter(t)`. | Annotating them `fx.Pointer` and calling `fx.recast_iter` fails with `'fly.recast_iter' op operand #0 must be ...`. |
+| LLVM intrinsics with no ROCDL op: `llvm.call_intrinsic(T.i64, "llvm.readcyclecounter", [], [], [])`. | e.g. `llvm.readcyclecounter` (shader cycles) and `llvm.readsteadycounter` (constant-rate real-time counter) for in-kernel timing. |
 
 ## 5. Debugging Workflow
 
 Order checks cheapest-first; most "fix didn't work" reports are stale cache.
 
 1. **Invalidate caches unconditionally** — `rm -rf ~/.flydsl /tmp/flydsl*` and clear any `lru_cache`. Re-run before believing any result.
+   - **Read the ISA without a GPU**: `FLYDSL_COMPILE_ONLY=1 FLYDSL_COMPILE_ARCH=<gfxNNNN> FLYDSL_DUMP_IR=1 FLYDSL_DUMP_DIR=<dir>` compiles on a GPU-less host or container (`HIP_VISIBLE_DEVICES=`) and writes every pass plus `22_final_isa.s`; check the hot loop before queueing for a shared GPU.
 2. **Classify by symptom** and dispatch:
    - all-NaN → softmax `-inf − (−inf)` or `1/0`; guard with `.select` (`(qk_max > NEG_INF).select(diff, 0)`, `(sum > 0).select(sum, 1.0)`).
    - all-zeros → wrong output stride, wrong partition slot, or unwritten buffers; sentinel-init with `-999.0` to detect skipped writes.

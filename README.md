@@ -17,6 +17,9 @@ the training-step throughput went from 317 to 912 TFLOPS.
 | `skills/kernel-optimize/` | The optimization loop, plus a knowledge base by op (`gemm`, `attention`), hardware (`gfx942`, `gfx950`, `gfx1250`), backend (`flydsl`, `triton`) and numerics (batch invariance) |
 | `skills/primus-turbo-develop/` | Primus-Turbo project skill: architecture, accuracy and performance verification, profiling, handoff to `kernel-optimize`. It is an example of the project-skill contract that `kernel-optimize` expects |
 | `skills/rccl-sdma/` | Running, verifying and measuring RCCL copy-engine (SDMA) collectives on MI355X: how RCCL picks the copy-engine path, Primus switches for Megatron, TorchTitan and Flux, multi-node settings, proving the copy engines ran, measurement method, debugging hangs, and building RCCL from a PR into the training image |
+| `skills/primus-projection/` | Primus performance / memory projection: simulate vs benchmark mode, out-of-tree GEMM backends and hardware profiles (no unreleased specs in Primus), runtime patches for architectures the projector does not model, hardware calibration including the FlyDSL matrix-core clock, and the measured-vs-projected roofline ratio for a training proxy |
+| `skills/gpu-lock/` | Per-GPU flock locking on shared nodes (`gpulock run / status / hold / history`), plus practices for agents working on a shared remote node |
+| `historical_experience/gfx1250/grouped_gemm_bf16/flydsl/` | `tips.md` from tuning the FlyDSL bf16 grouped GEMM for Muse Spark expert shapes (tile walk order, two workgroups per CU for fp32-accumulate wgrads, per-op LDS co-scheduling, tolerant row-count key lookup) |
 | `historical_experience/gfx1250/sparse_mla_fwd_bwd/flydsl/` | `tips.md` (per-round signal / takeaway entries) and `lessons_learned.md` (campaign retrospective) |
 | `historical_experience/gfx950/paged_attention/triton/` | `tips.md` from the OneTensor batch-invariant paged attention work on MI355X |
 | `tools/` | ISA analysis helpers for FlyDSL IR dumps: `isa_loop_hist.py` (hot-loop mnemonic histogram and diff), `isa_seq.py` (run-length op sequence) |
@@ -39,23 +42,25 @@ New in this repo:
 - [`skills/kernel-optimize/knowledge/backend/triton/`](skills/kernel-optimize/knowledge/backend/triton/overview.md) (overview, optimization directions, pitfalls)
   and the gfx950 paged-attention tips (`historical_experience/gfx950/paged_attention/triton/`).
 
-To use the skills from a project while still editing them, add this repo as a git submodule and
-symlink `.cursor/skills`, `.cursor/rules` and `agent/historical_experience` to its `skills/`,
-`rules/` and `historical_experience/` (OneTensor does this).
+## Installing
 
-## Installing Into a Project
-
-The skills expect this layout in the target repository:
+Install as **symlinks** into this checkout, so `git pull` updates every installed copy and edits
+made through an installed path land in the repo:
 
 ```bash
-mkdir -p .cursor/skills .cursor/rules agent
-cp -r rocm-skills/skills/* .cursor/skills/            # or .claude/skills/
-cp rocm-skills/rules/*.mdc .cursor/rules/
-cp -r rocm-skills/historical_experience agent/        # read by kernel-optimize (READ_HISTORICAL_TIPS)
+git clone https://github.com/Z-Y00/rocm-skills.git && cd rocm-skills
+./install.sh                  # ~/.cursor/skills/<skill> and ~/.cursor/rules/*.mdc -> this repo
+./install.sh --claude         # also ~/.claude/skills/<skill>
+./install.sh --project DIR    # DIR/.cursor/skills, DIR/.cursor/rules, DIR/agent/historical_experience
 ```
 
-`kernel-optimize` links to `../../rules/iteration_rules.mdc` from its `SKILL.md`, which resolves
-both in this repo and under `.cursor/`. For a project other than Primus-Turbo, write a project
+An existing entry that is not a symlink is moved to `<target>/.backup-<timestamp>/`, never
+deleted. In `--project` mode a real `agent/historical_experience` directory (e.g. Primus-Turbo's
+own) is kept; merge its tips into `historical_experience/` here by hand. A project can also add
+this repo as a git submodule and point the same symlinks at it.
+
+`kernel-optimize` links to `../../rules/iteration_rules.mdc` from its `SKILL.md`; with symlinks
+that resolves to this repo's `rules/`. For a project other than Primus-Turbo, write a project
 skill that provides the prerequisites listed in `skills/kernel-optimize/SKILL.md` (kernel path,
 focused test and benchmark commands, scoring, execution mode), using `primus-turbo-develop` as
 the template.

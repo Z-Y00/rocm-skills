@@ -1,0 +1,729 @@
+#!/usr/bin/env python3
+"""gpulock: per-GPU locks for a shared GPU node (see SKILL.md next to this file).
+
+One lock file per GPU, <dir>/gpu<N>.lock, taken with flock(2): the same lock as
+`flock <dir>/gpu<N>.lock <command>`, so plain-flock users and gpulock users exclude each other.
+
+  gpulock status                               per GPU: holder, waiters, processes on it (any user)
+  gpulock run -g 3 -n "what" -- <command...>   lock the GPUs (ascending order), wait until no other process is
+                                               on them, run, watch for intruders, unlock when the command exits
+  gpulock hold -g 0-3 [-t 2h] [-n "what"]      reserve GPUs for interactive work; Ctrl-C releases
+  gpulock history [--since 24h]                what gpulock ran on this node: waits, collisions, per user
+
+GPU numbers are KFD / HIP_VISIBLE_DEVICES indices. Lock dir: $GPULOCK_DIR, else the node's one shared lock
+directory under /var/tmp (gpu-locks, or an existing <name>-gpu-locks; finding several is an error, set
+$GPULOCK_DIR), else a new /var/tmp/gpu-locks. Python 3 standard library only.
+
+Every run / hold of every user is logged to <dir>/history.jsonl: a "start" line as soon as the GPUs are locked
+and an "end" line with the outcome, so a run killed with -9 or cut off by a node hang still shows up.
+"""
+
+import argparse
+import fcntl
+import glob
+import json
+import os
+import pwd
+import re
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+KFD = "/sys/class/kfd/kfd"
+MIN_VRAM = 256 << 20  # a process counts as "on" a GPU from this much VRAM
+DEFAULT_DIR = "/var/tmp/gpu-locks"
+HELD_ENV = "GPULOCK_HELD"  # GPUs an enclosing gpulock holds; a nested `gpulock run` on them does not lock again
+EX_FOREIGN = 75  # run: the locked GPUs stayed busy with processes that do not hold the lock; nothing ran
+
+
+def say(msg):
+    print(f"[gpulock {time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
+
+
+def die(msg, code=2):
+    say(msg)
+    sys.exit(code)
+
+
+def dur(s):
+    s = int(s)
+    if s >= 3600:
+        return f"{s // 3600}h{s % 3600 // 60:02d}m"
+    return f"{s // 60}m{s % 60:02d}s" if s >= 60 else f"{s}s"
+
+
+def parse_dur(text):
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([smhd]?)", text.strip())
+    if not m:
+        raise argparse.ArgumentTypeError(f"bad duration {text!r} (e.g. 90s, 30m, 2h)")
+    return float(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def read(path, default=""):
+    try:
+        with open(path, "rb") as f:
+            return f.read().decode(errors="replace")
+    except OSError:
+        return default
+
+
+def me():
+    return pwd.getpwuid(os.getuid()).pw_name
+
+
+# ------------------------------------------------------------------ GPUs and processes
+
+
+def gpu_index():
+    """{KFD gpu_id: GPU index}; the index is the HIP_VISIBLE_DEVICES number."""
+    try:
+        nodes = sorted(os.listdir(f"{KFD}/topology/nodes"), key=int)
+    except (OSError, ValueError):
+        return {}
+    ids = [read(f"{KFD}/topology/nodes/{n}/gpu_id").strip() for n in nodes]
+    return {int(g): i for i, g in enumerate(g for g in ids if g.isdigit() and g != "0")}
+
+
+def parse_gpus(spec, n):
+    """'3', '0,1', '0-3' or 'all' -> sorted list of GPU indices."""
+    if spec == "all":
+        if not n:
+            die("no GPUs found under /sys/class/kfd: name them (-g 0-3)")
+        return list(range(n))
+    out = set()
+    try:
+        for part in spec.split(","):
+            part = part.strip()
+            if "-" in part:
+                lo, hi = part.split("-", 1)
+                out.update(range(int(lo), int(hi) + 1))
+            elif part:
+                out.add(int(part))
+    except ValueError:
+        die(f"bad GPU list {spec!r} (e.g. 3, 0,1, 0-3, all)")
+    bad = sorted(g for g in out if g < 0 or (n and g >= n))
+    if bad or not out:
+        die(f"no GPU {bad or spec} on this node ({n} GPUs)")
+    return sorted(out)
+
+
+def gpu_procs(index):
+    """{GPU index: {pid: VRAM bytes}} of the processes with at least MIN_VRAM on that GPU (any user)."""
+    out = {}
+    try:
+        pids = os.listdir(f"{KFD}/proc")
+    except OSError:
+        return out
+    for p in pids:
+        d = f"{KFD}/proc/{p}"
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for f in names:
+            if not f.startswith("vram_"):
+                continue
+            try:
+                gid, b = int(f[5:]), int(read(f"{d}/{f}", "0").strip() or 0)
+            except ValueError:
+                continue
+            if b >= MIN_VRAM and gid in index:
+                out.setdefault(index[gid], {})[int(p)] = b
+    return out
+
+
+def proc_argv(pid):
+    s = read(f"/proc/{pid}/cmdline")
+    return s.rstrip("\0").split("\0") if s else []
+
+
+def proc_cmd(pid, width=100):
+    return " ".join(proc_argv(pid))[:width]
+
+
+def proc_user(pid):
+    try:
+        return pwd.getpwuid(os.stat(f"/proc/{pid}").st_uid).pw_name
+    except (OSError, KeyError):
+        return "?"
+
+
+_BOOT = []
+
+
+def proc_start(pid):
+    """Start time (epoch) of a process, or None."""
+    if not _BOOT:
+        _BOOT.append(next((int(x.split()[1]) for x in read("/proc/stat").splitlines() if x.startswith("btime ")), 0))
+    st = read(f"/proc/{pid}/stat")
+    try:
+        return _BOOT[0] + int(st[st.rfind(")") + 2 :].split()[19]) / os.sysconf("SC_CLK_TCK")
+    except (ValueError, IndexError):
+        return None
+
+
+def descendants(root):
+    """root and every process below it (host pid namespace)."""
+    kids = {}
+    for p in os.listdir("/proc"):
+        if p.isdigit():
+            st = read(f"/proc/{p}/stat")
+            try:
+                kids.setdefault(int(st[st.rfind(")") + 2 :].split()[1]), []).append(int(p))
+            except (ValueError, IndexError):
+                pass
+    out, todo = {root}, [root]
+    while todo:
+        for c in kids.get(todo.pop(), []):
+            if c not in out:
+                out.add(c)
+                todo.append(c)
+    return out
+
+
+class Containers:
+    """Docker container name of a process (from its cgroup); 'host' outside containers, None once it exited."""
+
+    def __init__(self):
+        self.names, self.t = {}, 0.0
+
+    def refresh(self):
+        self.t = time.time()
+        try:
+            r = subprocess.run(
+                ["docker", "ps", "--no-trunc", "--format", "{{.ID}} {{.Names}}"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.names = dict(x.split(" ", 1) for x in r.stdout.splitlines() if " " in x)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    def of(self, pid):
+        cg = read(f"/proc/{pid}/cgroup")
+        if not cg:
+            return None
+        m = re.search(r"[0-9a-f]{64}", cg)
+        if not m:
+            return "host"
+        if m.group(0) not in self.names and time.time() - self.t > 5:
+            self.refresh()
+        return self.names.get(m.group(0), m.group(0)[:12])
+
+
+# options of `docker exec` / `docker run` that take a value
+_DOCKER_VALUE_OPTS = {
+    "-e", "--env", "--env-file", "-w", "--workdir", "-u", "--user", "--detach-keys", "--name", "-v", "--volume",
+    "--device", "--network", "--ipc", "--group-add", "--cap-add", "--cap-drop", "--security-opt", "--ulimit",
+    "--entrypoint", "-p", "--publish", "-m", "--memory", "--shm-size", "-l", "--label", "--mount", "--gpus",
+    "-h", "--hostname", "--platform", "--pull", "--cpus", "--cpuset-cpus", "--pid", "--restart",
+}  # fmt: skip
+
+
+def docker_target(argv):
+    """The container a `docker exec ... <name>` or `docker run --name <name>` command line addresses."""
+    if not argv or os.path.basename(argv[0]) != "docker":
+        return None
+    args = argv[1:]
+    if args[:1] == ["container"]:
+        args = args[1:]
+    if not args or args[0] not in ("exec", "run"):
+        return None
+    rest = args[1:]
+    if args[0] == "run":
+        for i, x in enumerate(rest):
+            if x == "--name" and i + 1 < len(rest):
+                return rest[i + 1]
+            if x.startswith("--name="):
+                return x.split("=", 1)[1]
+        return None
+    i = 0
+    while i < len(rest) and rest[i].startswith("-") and rest[i] != "--":
+        i += 2 if (rest[i] in _DOCKER_VALUE_OPTS and "=" not in rest[i]) else 1
+    i += i < len(rest) and rest[i] == "--"
+    return rest[i] if i < len(rest) else None
+
+
+# ------------------------------------------------------------------ locks
+
+
+def lock_dir():
+    d = os.environ.get("GPULOCK_DIR")
+    if not d:
+        # The node's one shared lock directory: the default one, or one an earlier setup created under another
+        # name (<parent>/<name>-gpu-locks), so that plain-flock users of it and gpulock users exclude each other.
+        # Never pick one of several silently: two directories would be two independent sets of locks.
+        cands = [DEFAULT_DIR] + glob.glob(os.path.join(os.path.dirname(DEFAULT_DIR), "*-gpu-locks"))
+        found = sorted({os.path.realpath(x) for x in cands if os.path.isdir(x)})
+        if len(found) > 1:
+            die(f"several shared lock dirs: {' '.join(found)}; set GPULOCK_DIR to the one this node's users lock")
+        d = found[0] if found else DEFAULT_DIR
+    if not os.path.isdir(d):
+        os.makedirs(d, exist_ok=True)
+        try:
+            os.chmod(d, 0o1777)
+        except OSError:
+            pass
+    return d
+
+
+def open_lock(path):
+    fd = os.open(path, os.O_RDONLY | os.O_CREAT, 0o666)  # not inherited by the command (PEP 446)
+    try:
+        if os.fstat(fd).st_uid == os.getuid():
+            os.fchmod(fd, 0o666)
+    except OSError:
+        pass
+    return fd
+
+
+def lock_key(path):
+    """How /proc/locks names the file: major:minor (hex) : inode."""
+    st = os.stat(path)
+    return f"{os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}:{st.st_ino}"
+
+
+def proc_locks():
+    """{lock key: [(pid, waiting)]} of every flock(2) lock on the node (/proc/locks is world-readable)."""
+    out = {}
+    for line in read("/proc/locks").splitlines():
+        f = line.split()
+        waiting = "->" in f
+        f = [x for x in f if x != "->"]
+        if len(f) >= 6 and f[1] == "FLOCK" and f[4].isdigit():
+            out.setdefault(f[5], []).append((int(f[4]), waiting))
+    return out
+
+
+def summarize(argv, width=110):
+    """A gpulock command line as its note and command, a `flock <file> ...` chain as the command it runs."""
+    if "gpulock" in [os.path.basename(x) for x in argv[:2]]:
+        note = next((argv[i + 1] for i, x in enumerate(argv[:-1]) if x in ("-n", "--note")), "")
+        rest = argv[argv.index("--") + 1 :] if "--" in argv else []
+        sub = next((x for x in argv[1:4] if x in ("run", "hold")), "")
+        return ((f'"{note}" ' if note else "") + (" ".join(rest) or f"gpulock {sub}"))[:width]
+    a = list(argv)
+    while a and os.path.basename(a[0]) == "flock":
+        i = 1
+        while i < len(a) and a[i].startswith("-"):
+            i += 2 if a[i] in ("-w", "--wait", "--timeout", "-E", "--conflict-exit-code") else 1
+        a = a[i + 1 :]  # drop the lock file
+    return " ".join(a)[:width]
+
+
+def describe(pid, now=None):
+    now = now or time.time()
+    if not os.path.exists(f"/proc/{pid}"):
+        return f"pid {pid} (exited: a process that inherited its file descriptor still holds the lock)"
+    t = proc_start(pid)
+    since = f" since {time.strftime('%H:%M:%S', time.localtime(t))} ({dur(now - t)})" if t else ""
+    return f"{proc_user(pid)} pid {pid}{since}: {summarize(proc_argv(pid))}"
+
+
+def holders_of(key):
+    return [p for p, w in proc_locks().get(key, []) if not w]
+
+
+def acquire(d, gpus):
+    """Lock the GPUs in ascending order (no deadlock with anyone who also goes up); block while one is busy.
+    Returns (fds, [{gpu, user, what, waited}] for each GPU that was busy)."""
+    fds, blocked, courtesy = [], [], False
+    for g in gpus:
+        path = f"{d}/gpu{g}.lock"
+        fd = open_lock(path)
+        key = lock_key(path)
+        if not courtesy and any(w for _, w in proc_locks().get(key, [])):
+            # someone already queues for this GPU: let them go first, or a holder that comes straight back
+            # for its next run would often win the race against them
+            courtesy = True
+            time.sleep(3)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            hs = holders_of(key)
+            who = "; ".join(describe(p) for p in hs) or "unknown"
+            holder_user = proc_user(hs[0]) if hs else "?"  # now: the holder may be gone once we get the lock
+            say(f"gpu{g} is busy: {who} -- waiting (`gpulock status` shows the queue)")
+            t0, stop = time.time(), threading.Event()
+
+            def remind(stop=stop, key=key, g=g, t0=t0):
+                while not stop.wait(600):
+                    now = "; ".join(describe(p) for p in holders_of(key)) or "?"
+                    say(f"still waiting for gpu{g} ({dur(time.time() - t0)}): {now}")
+
+            threading.Thread(target=remind, daemon=True).start()
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            finally:
+                stop.set()
+            waited = time.time() - t0
+            say(f"gpu{g} acquired after {dur(waited)}")
+            blocked.append(
+                {"gpu": g, "user": holder_user, "what": who[:160], "waited": round(waited)}
+            )
+        try:
+            os.utime(fd)  # systemd-tmpfiles deletes /var/tmp files after 30 days without a time stamp change
+        except OSError:
+            pass
+        fds.append(fd)
+    return fds, blocked
+
+
+def release(fds):
+    for fd in fds:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    fds.clear()
+
+
+def held_from_env():
+    return {int(x) for x in os.environ.get(HELD_ENV, "").split(",") if x.strip().isdigit()}
+
+
+def busy_list(gpus, index, ctrs, skip=lambda pid, ctr: False):
+    out = []
+    procs = gpu_procs(index)
+    for g in gpus:
+        for pid, b in sorted(procs.get(g, {}).items()):
+            c = ctrs.of(pid)
+            if c is not None and not skip(pid, c):
+                out.append((g, pid, c, b))
+    return out
+
+
+def fmt_busy(busy):
+    return "; ".join(f"gpu{g} pid {pid} {c} {b / 1e9:.1f} GB ({proc_user(pid)}: {proc_cmd(pid, 60)})" for g, pid, c, b in busy)
+
+
+def wait_free(gpus, index, ctrs, policy, max_wait):
+    """After locking: are the GPUs free of processes? (an intruder without the lock, or what a killed
+    `docker exec` client left running in its container). wait: until they are (False after max_wait)."""
+    t0, said = time.time(), False
+    while True:
+        busy = busy_list(gpus, index, ctrs)
+        if not busy:
+            if said:
+                say(f"GPUs free after {dur(time.time() - t0)}")
+            return True
+        if policy == "warn":
+            say(f"WARNING the locked GPUs are in use by processes without the lock: {fmt_busy(busy)}; running anyway")
+            return True
+        if time.time() - t0 >= max_wait:
+            say(f"giving up after {dur(time.time() - t0)}, still on the GPUs: {fmt_busy(busy)}")
+            return False
+        if not said and time.time() - t0 >= 5:
+            say(f"locked, but in use by processes without the lock: {fmt_busy(busy)} -- waiting up to {dur(max_wait)}")
+            said = True
+        time.sleep(5)
+
+
+def history_rec(kind, gpus, note, cmd, t_queue, t_lock, blocked):
+    """The record of a run / hold. It is written twice: event "start" as soon as the GPUs are locked, so a run
+    that never ends normally (gpulock killed, node hang or reboot) still shows who held which GPUs since when,
+    and event "end" with the outcome."""
+    host, pid = socket.gethostname().split(".")[0], os.getpid()
+    start = proc_start(pid)
+    return {
+        "v": 2, "event": "start", "id": f"{host}:{pid}:{round(t_lock)}", "kind": kind, "user": me(), "host": host,
+        "pid": pid, "pid_start": round(start, 2) if start else None, "gpus": gpus, "note": note or "",
+        "cmd": cmd[:300], "queued": round(t_queue), "locked": round(t_lock), "lock_wait": round(t_lock - t_queue),
+        "blocked_by": blocked,
+    }  # fmt: skip
+
+
+def still_running(r):
+    """Whether the gpulock process of a start record without an end record is still alive on this node."""
+    pid, t = r.get("pid"), r.get("pid_start")
+    if not pid or t is None or r.get("host") != socket.gethostname().split(".")[0]:
+        return False
+    now_t = proc_start(pid)
+    return now_t is not None and abs(now_t - t) < 2
+
+
+def write_history(d, rec):
+    """One JSON line per event in <dir>/history.jsonl (O_APPEND, < 4 KiB: atomic among writers)."""
+    line = json.dumps(rec, ensure_ascii=False)
+    if len(line) > 3800:
+        rec = dict(rec, cmd=rec.get("cmd", "")[:100], foreign=rec.get("foreign", [])[:3])
+        line = json.dumps(rec, ensure_ascii=False)[:3800]
+    try:
+        fd = os.open(f"{d}/history.jsonl", os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o666)
+        try:
+            if os.fstat(fd).st_uid == os.getuid():
+                os.fchmod(fd, 0o666)
+            os.write(fd, (line + "\n").encode())
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+# ------------------------------------------------------------------ commands
+
+
+class Watch(threading.Thread):
+    """Samples the locked GPUs while the command runs. Processes of the run: its host descendants and the
+    containers its `docker exec <name>` / `docker run --name <name>` command lines address (+ --own-container);
+    anything else on the GPUs is an intruder."""
+
+    def __init__(self, gpus, index, ctrs, child_pid, own, every):
+        super().__init__(daemon=True)
+        self.gpus, self.index, self.ctrs, self.child, self.every = gpus, index, ctrs, child_pid, every
+        self.own, self.desc, self.foreign, self.stop = set(own), {child_pid}, {}, threading.Event()
+
+    def mine(self, pid, ctr):
+        return pid in self.desc or (ctr != "host" and ctr in self.own)
+
+    def sample(self):
+        self.desc |= descendants(self.child)
+        for p in list(self.desc):
+            t = docker_target(proc_argv(p))
+            if t:
+                self.own.add(t)
+        now = time.time()
+        for g, pid, c, b in busy_list(self.gpus, self.index, self.ctrs, self.mine):
+            r = self.foreign.get(pid)
+            if r is None:
+                r = self.foreign[pid] = {
+                    "pid": pid, "gpu": g, "ctr": c, "user": proc_user(pid), "cmd": proc_cmd(pid, 80),
+                    "first": round(now), "last": round(now), "gb": round(b / 1e9, 1),
+                }  # fmt: skip
+                say(f"WARNING gpu{g}: pid {pid} ({c}, {r['user']}, {b / 1e9:.1f} GB) is on a GPU this run locked: {r['cmd']}")
+            else:
+                r["last"], r["gb"] = round(now), max(r["gb"], round(b / 1e9, 1))
+
+    def run(self):
+        while not self.stop.wait(self.every):
+            try:
+                self.sample()
+            except Exception as e:  # noqa: BLE001 -- a race with an exiting process must not end the watch
+                say(f"watch: {type(e).__name__}: {e}")
+
+
+def cmd_run(a):
+    cmd = a.command[1:] if a.command[:1] == ["--"] else a.command
+    if not cmd:
+        die('nothing to run: gpulock run -g <gpus> -n "<what>" -- <command ...>')
+    index = gpu_index()
+    gpus = parse_gpus(a.gpus, len(index))
+    held = held_from_env()
+    nested = bool(held) and set(gpus) <= held
+    if held and not nested:
+        die(f"gpu{sorted(set(gpus) - held)} not held by the enclosing gpulock ({HELD_ENV}={sorted(held)}): taking "
+            "more GPUs while holding some can deadlock; lock all of them in the outer gpulock")  # fmt: skip
+    visible = " ".join(cmd) + (f" HIP_VISIBLE_DEVICES={os.environ['HIP_VISIBLE_DEVICES']}" if os.environ.get("HIP_VISIBLE_DEVICES") else "")
+    for m in re.finditer(r"HIP_VISIBLE_DEVICES=([0-9,]+)", visible):
+        extra = {int(x) for x in m.group(1).split(",") if x} - set(gpus)
+        if extra:
+            say(f"WARNING the command / environment uses HIP_VISIBLE_DEVICES={m.group(1)}: gpu{sorted(extra)} not locked")
+    d, ctrs = lock_dir(), Containers()
+    t_queue = time.time()
+    fds, blocked = ([], []) if nested else acquire(d, gpus)
+    t_lock = time.time()
+    rec = history_rec("run", gpus, a.note, " ".join(cmd), t_queue, t_lock, blocked)
+    if not nested:
+        write_history(d, rec)
+    if not nested and a.foreign != "ignore" and not wait_free(gpus, index, ctrs, a.foreign, a.max_wait_foreign):
+        release(fds)
+        rec.update(event="end", end=round(time.time()), exit=EX_FOREIGN, ran=0)
+        write_history(d, rec)
+        return EX_FOREIGN
+    env = dict(os.environ, **{HELD_ENV: ",".join(map(str, sorted(set(gpus) | held)))})
+    env.setdefault("HIP_VISIBLE_DEVICES", ",".join(map(str, gpus)))
+    t_start = time.time()
+    say(f"gpu{','.join(map(str, gpus))} locked{' (nested)' if nested else ''}"
+        f"{f' after {dur(t_start - t_queue)}' if t_start - t_queue >= 1 else ''}; running: {' '.join(cmd)[:120]}")  # fmt: skip
+    try:
+        child = subprocess.Popen(cmd, env=env)
+    except OSError as e:
+        release(fds)
+        if not nested:
+            write_history(d, dict(rec, event="end", end=round(time.time()), exit=127, ran=0))
+        die(f"cannot run {cmd[0]}: {e}", 127)
+    # The terminal's Ctrl-C reaches the command itself (same process group): wait for it, keep the lock until
+    # it exits. TERM / HUP (timeout, closed session) go to gpulock only: pass them on.
+    signal.signal(signal.SIGINT, lambda *_: None)
+    for s in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(s, lambda sig, _f: child.send_signal(sig))
+    watch = Watch(gpus, index, ctrs, child.pid, a.own_container or [], a.watch)
+    watch.start()
+    rc = child.wait()
+    watch.stop.set()
+    watch.join(timeout=10)
+    t_end = time.time()
+    # what the run leaves on the GPUs (e.g. container processes of a killed `docker exec` client)
+    t0 = time.time()
+    while True:
+        left = busy_list(gpus, index, ctrs, lambda pid, c: not watch.mine(pid, c))
+        if not left or time.time() - t0 >= a.drain:
+            break
+        time.sleep(2)
+    if left:
+        say(f"WARNING releasing with processes of this run still on the GPUs (the next holder will wait for them): {fmt_busy(left)}")
+    release(fds)
+    rc = rc if rc >= 0 else 128 - rc
+    foreign = sorted(watch.foreign.values(), key=lambda r: r["first"])
+    rec.update(event="end", end=round(t_end), ran=round(t_end - t_start), exit=rc, foreign=foreign[:10],
+               left=[{"pid": p, "gpu": g, "ctr": c} for g, p, c, _ in left][:5])  # fmt: skip
+    if not nested:
+        write_history(d, rec)
+    intr = "; ".join(f"gpu{r['gpu']} {r['ctr']} ({r['user']}) {time.strftime('%H:%M:%S', time.localtime(r['first']))}-"
+                     f"{time.strftime('%H:%M:%S', time.localtime(r['last']))} {r['gb']} GB" for r in foreign)  # fmt: skip
+    say(f"done: exit {rc}, lock wait {dur(t_lock - t_queue)}, ran {dur(t_end - t_start)}; "
+        + (f"INTRUDERS on the locked GPUs: {intr}" if foreign else "no other process on the locked GPUs"))  # fmt: skip
+    return rc
+
+
+def cmd_hold(a):
+    index = gpu_index()
+    gpus = parse_gpus(a.gpus, len(index))
+    if held_from_env():
+        die(f"already inside a gpulock ({HELD_ENV}={os.environ[HELD_ENV]})")
+    d, ctrs = lock_dir(), Containers()
+    t_queue = time.time()
+    fds, blocked = acquire(d, gpus)
+    t_lock = time.time()
+    rec = history_rec("hold", gpus, a.note, "", t_queue, t_lock, blocked)
+    write_history(d, rec)
+    wait_free(gpus, index, ctrs, "warn", 0)
+    say(f"holding gpu{','.join(map(str, gpus))} for up to {dur(a.time)}; Ctrl-C releases")
+
+    def interrupt(*_):
+        raise KeyboardInterrupt
+
+    for s in (signal.SIGTERM, signal.SIGHUP):  # a kill / closed session releases like Ctrl-C and is recorded
+        signal.signal(s, interrupt)
+    try:
+        time.sleep(a.time)
+    except KeyboardInterrupt:
+        pass
+    t_end = time.time()
+    release(fds)
+    rec.update(event="end", end=round(t_end), ran=round(t_end - t_lock), exit=0, foreign=[])
+    write_history(d, rec)
+    say(f"released after {dur(t_end - t_lock)}")
+    return 0
+
+
+def cmd_status(a):
+    d, index, ctrs, now = lock_dir(), gpu_index(), Containers(), time.time()
+    gpus = set(range(len(index))) | {
+        int(m.group(1)) for f in os.listdir(d) if (m := re.fullmatch(r"gpu(\d+)\.lock", f))
+    }
+    locks, procs = proc_locks(), gpu_procs(index)
+    print(f"{socket.gethostname().split('.')[0]}: {len(index)} GPUs, locks in {d}")
+    for g in sorted(gpus):
+        path = f"{d}/gpu{g}.lock"
+        entries = locks.get(lock_key(path), []) if os.path.exists(path) else []
+        holders = [p for p, w in entries if not w]
+        print(f"gpu{g}  " + (f"HELD  {describe(holders[0], now)}" if holders else "free"))
+        for p, w in entries:
+            if w:
+                print(f"      waits {describe(p, now)}")
+        for pid, b in sorted(procs.get(g, {}).items()):
+            c = ctrs.of(pid)
+            if c is not None:
+                flag = "" if holders else "   << in use without its lock"
+                print(f"      proc  pid {pid} {b / 1e9:.1f} GB {c}: {proc_cmd(pid, 70)}{flag}")
+    return 0
+
+
+def cmd_history(a):
+    d = lock_dir()
+    now = time.time()
+    since = now - a.since
+    open_, done = {}, []  # start records still waiting for their end record; finished records
+    for line in read(f"{d}/history.jsonl").splitlines():
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if r.get("event") == "start":
+            open_[r.get("id")] = r
+        else:  # an end record, or a v1 record (written once, at the end)
+            open_.pop(r.get("id"), None)
+            done.append(r)
+    for r in open_.values():  # no end record: still running, or gpulock was killed / the node went down
+        done.append(dict(r, open="running" if still_running(r) else "lost"))
+
+    def end_of(r):
+        return now if r.get("open") == "running" else r.get("end")
+
+    rows = [r for r in done if (end_of(r) or r.get("locked", 0)) >= since and (not a.user or r.get("user") == a.user)]
+    if not rows:
+        print(f"no gpulock runs in the last {dur(a.since)} ({d}/history.jsonl)")
+        return 0
+    hm = lambda t: time.strftime("%m-%d %H:%M", time.localtime(t))  # noqa: E731
+    print(f"{'locked':<12} {'user':<10} {'gpus':<8} {'wait':>7} {'ran':>7} {'exit':>4}  waited for / intruders  |  note or command")
+    for r in sorted(rows, key=lambda r: r.get("locked", 0)):
+        g = r.get("gpus", [])
+        gs = f"{g[0]}-{g[-1]}" if len(g) > 2 and g == list(range(g[0], g[-1] + 1)) else ",".join(map(str, g))
+        waited = ", ".join(f"{b['user']} {dur(b['waited'])}" for b in r.get("blocked_by", []))
+        intr = ", ".join(f"INTRUDER {f['ctr']}" for f in r.get("foreign", []))
+        state = {"running": "STILL RUNNING", "lost": "NO END RECORD (gpulock killed or node down)"}.get(r.get("open"), "")
+        what = r.get("note") or r.get("cmd", "") or r.get("kind", "")
+        ran = dur(now - r.get("locked", now)) if r.get("open") == "running" else "?" if r.get("open") else dur(r.get("ran", 0))
+        ex = {"running": "run", "lost": "?"}.get(r.get("open"), r.get("exit", ""))
+        print(f"{hm(r.get('locked', 0)):<12} {r.get('user', '?'):<10} {gs:<8} {dur(r.get('lock_wait', 0)):>7} "
+              f"{ran:>7} {ex:>4}  {'; '.join(x for x in (state, waited, intr) if x) or '-'}  |  {what[:60]}")  # fmt: skip
+    users = sorted({r.get("user", "?") for r in rows} | {b["user"] for r in rows for b in r.get("blocked_by", [])})
+    n_wait = [r for r in rows if r.get("lock_wait", 0) > 0]
+    print(f"\nnode (last {dur(a.since)}): {len(rows)} runs/holds, {len(n_wait)} waited for a lock "
+          f"(total {dur(sum(r['lock_wait'] for r in n_wait))}), {sum(1 for r in rows if r.get('foreign'))} with intruders, "
+          f"{sum(1 for r in rows if r.get('open') == 'running')} running now, "
+          f"{sum(1 for r in rows if r.get('open') == 'lost')} without an end record")  # fmt: skip
+    print("per user: runs, GPU time held, time spent waiting, time others waited for them, runs with intruders")
+    for u in users:
+        mine = [r for r in rows if r.get("user") == u]
+        held = sum((end_of(r) - r.get("locked", 0)) * len(r.get("gpus", [])) for r in mine if end_of(r))
+        waited = sum(r.get("lock_wait", 0) for r in mine)
+        caused = sum(b["waited"] for r in rows if r.get("user") != u for b in r.get("blocked_by", []) if b["user"] == u)
+        intr = sum(1 for r in mine if r.get("foreign"))
+        print(f"  {u:<10} {len(mine):>4} runs  {dur(held):>8} GPU  waited {dur(waited):>7}  others waited {dur(caused):>7}  intruded {intr}")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="gpulock", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("status", help="holders, waiters and processes of every GPU")
+    s.set_defaults(fn=cmd_status)
+    r = sub.add_parser("run", help="lock GPUs, run a command, unlock")
+    r.add_argument("-g", "--gpus", required=True, help="3 | 0,1 | 0-3 | all")
+    r.add_argument("-n", "--note", help="what this is (shown to everyone in status / history)")
+    r.add_argument("--foreign", choices=("wait", "warn", "ignore"), default="wait",
+                   help="processes on the GPUs after locking: wait for them (default), warn and run, ignore")  # fmt: skip
+    r.add_argument("--max-wait-foreign", type=parse_dur, default=1800, metavar="DUR",
+                   help=f"--foreign wait gives up after this (default 30m; exit {EX_FOREIGN}, nothing ran)")  # fmt: skip
+    r.add_argument("--own-container", action="append", metavar="NAME",
+                   help="container whose GPU processes belong to this run (found by itself from docker exec / docker run --name)")  # fmt: skip
+    r.add_argument("--watch", type=parse_dur, default=5, metavar="DUR", help="intruder sampling period (default 5s)")
+    r.add_argument("--drain", type=parse_dur, default=30, metavar="DUR",
+                   help="after the command: wait this long for its processes to leave the GPUs (default 30s)")  # fmt: skip
+    r.add_argument("command", nargs=argparse.REMAINDER, help="-- command ...")
+    r.set_defaults(fn=cmd_run)
+    h = sub.add_parser("hold", help="reserve GPUs for interactive work (Ctrl-C releases)")
+    h.add_argument("-g", "--gpus", required=True)
+    h.add_argument("-n", "--note")
+    h.add_argument("-t", "--time", type=parse_dur, default=7200, metavar="DUR", help="release after (default 2h)")
+    h.set_defaults(fn=cmd_hold)
+    y = sub.add_parser("history", help="runs and holds made with gpulock on this node")
+    y.add_argument("--since", type=parse_dur, default=86400, metavar="DUR", help="default 24h")
+    y.add_argument("--user")
+    y.set_defaults(fn=cmd_history)
+    a = ap.parse_args()
+    try:
+        return a.fn(a)
+    except KeyboardInterrupt:
+        say("interrupted")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
