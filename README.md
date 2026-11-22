@@ -3,6 +3,11 @@
 Agent skills and kernel-optimization knowledge for AMD GPUs (ROCm), packaged so a coding agent
 (Cursor, Claude Code, or similar) can drive kernel performance campaigns on its own.
 
+**Install by symlink (the default for this repo):** clone it and run `./install.sh`. Every skill
+and rule is linked into `~/.cursor/` (add `--claude` for `~/.claude/skills`, or `--project DIR`
+for one repository), so `git pull` updates them in place. Do not copy the files; see
+[Installing](#installing).
+
 The skills and rules come from [AMD-AGI/Primus-Turbo](https://github.com/AMD-AGI/Primus-Turbo)
 (`.cursor/skills`, `.cursor/rules`). On top of them, this repo adds what we learned optimizing
 the DeepSeek-V4 sparse-MLA forward and backward kernels in FlyDSL on **MI455X (gfx1250)**
