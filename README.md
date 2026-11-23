@@ -23,7 +23,8 @@ the training-step throughput went from 317 to 912 TFLOPS.
 | `skills/primus-turbo-develop/` | Primus-Turbo project skill: architecture, accuracy and performance verification, profiling, handoff to `kernel-optimize`. It is an example of the project-skill contract that `kernel-optimize` expects |
 | `skills/rccl-sdma/` | Running, verifying and measuring RCCL copy-engine (SDMA) collectives on MI355X: how RCCL picks the copy-engine path, Primus switches for Megatron, TorchTitan and Flux, multi-node settings, proving the copy engines ran, measurement method, debugging hangs, and building RCCL from a PR into the training image |
 | `skills/primus-projection/` | Primus performance / memory projection: simulate vs benchmark mode, out-of-tree GEMM backends and hardware profiles (no unreleased specs in Primus), runtime patches for architectures the projector does not model, hardware calibration including the FlyDSL matrix-core clock, and the measured-vs-projected roofline ratio for a training proxy |
-| `skills/gpu-lock/` | Per-GPU flock locking on shared nodes (`gpulock run / status / hold / history`), plus practices for agents working on a shared remote node |
+| `gpu-lock` (from [lhzhang333/gpulock](https://github.com/lhzhang333/gpulock)) | Fair per-GPU queueing on shared nodes (`gpulock run / status / hold / exclusive / history`). Not vendored: `install.sh` clones it to `~/.local/share/gpulock` (SSH, HTTPS fallback; private, needs read access), links `~/.local/bin/gpulock` and links the clone as the `gpu-lock` skill; gpulock updates its clone by itself |
+| `skills/shared-gpu-node/` | Practices for agents running GPU work on a shared remote node over ssh: background runs under gpulock, container mounts, compile checks before queueing, flaky-link copies, snap docker paths, noise between sessions |
 | `historical_experience/gfx1250/grouped_gemm_bf16/flydsl/` | `tips.md` from tuning the FlyDSL bf16 grouped GEMM for Muse Spark expert shapes (tile walk order, two workgroups per CU for fp32-accumulate wgrads, per-op LDS co-scheduling, tolerant row-count key lookup) |
 | `historical_experience/gfx1250/sparse_mla_fwd_bwd/flydsl/` | `tips.md` (per-round signal / takeaway entries) and `lessons_learned.md` (campaign retrospective) |
 | `historical_experience/gfx950/paged_attention/triton/` | `tips.md` from the OneTensor batch-invariant paged attention work on MI355X |
@@ -57,6 +58,7 @@ git clone https://github.com/Z-Y00/rocm-skills.git && cd rocm-skills
 ./install.sh                  # ~/.cursor/skills/<skill> and ~/.cursor/rules/*.mdc -> this repo
 ./install.sh --claude         # also ~/.claude/skills/<skill>
 ./install.sh --project DIR    # DIR/.cursor/skills, DIR/.cursor/rules, DIR/agent/historical_experience
+./install.sh --no-gpulock     # skip the gpu-lock skill (gpulock clone)
 ```
 
 An existing entry that is not a symlink is moved to `<target>/.backup-<timestamp>/`, never
