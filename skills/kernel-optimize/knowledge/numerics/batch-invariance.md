@@ -6,6 +6,9 @@ to any reduction kernel: GEMM, grouped GEMM, attention, norms, softmax. It compl
 [`../ops/attention/math-optimizations.md`](../ops/attention/math-optimizations.md) (deterministic
 reductions) with the stronger requirement that the reduction order must not depend on the batch.
 
+Integration pitfalls (gradient precision, HIP graphs, strided inputs, `out=`, test coverage) are in
+[`rl-kernel-pitfalls.md`](rl-kernel-pitfalls.md).
+
 Background: Thinking Machines, "Defeating Nondeterminism in LLM Inference"; SGLang's deterministic
 inference mode (batch-invariant ops, fixed split tile sizes). The findings below were measured on
 MI355X (gfx950), Triton 3.8, ROCm 7.x/10.x, in the OneTensor project.

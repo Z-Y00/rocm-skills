@@ -45,6 +45,10 @@ New in this repo:
   how to keep a kernel bitwise stable across batch shapes and between inference and training
   (aligned split-K / split-KV, split vs fused modes, exact online-softmax no-ops, masked loads, and
   the measured gfx950 rule that launch layouts with warps on both tile axes change bits).
+- [`skills/kernel-optimize/knowledge/numerics/rl-kernel-pitfalls.md`](skills/kernel-optimize/knowledge/numerics/rl-kernel-pitfalls.md):
+  common pitfalls when an RL rollout engine and a trainer share a kernel: gradients from a rounded
+  output, hidden atomics, work and recompiles driven by a HIP graph's length bound, contiguous-only
+  inputs, `out=` buffers, position conventions, and end-to-end tests that miss the real paths.
 - [`skills/kernel-optimize/knowledge/backend/triton/`](skills/kernel-optimize/knowledge/backend/triton/overview.md) (overview, optimization directions, pitfalls)
   and the gfx950 paged-attention tips (`historical_experience/gfx950/paged_attention/triton/`).
 
