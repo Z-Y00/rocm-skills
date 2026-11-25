@@ -54,6 +54,44 @@ context in eager mode. Pass length-derived values as runtime arguments, with
 `@triton.jit(do_not_specialize=[...])`: Triton otherwise still specializes integer arguments on
 `== 1` and divisibility by 16.
 
+**A JIT launch cache keyed on runtime values.** The FlyDSL launcher cached compiled launchers in a
+dict keyed on its scalar arguments (batch, max lengths, strides, split programs), all runtime
+`Int32`s. Every eager decode step with a new `max_seqlen_k` missed it and called `flyc.compile`
+again: FlyDSL's own cache made that ~0.2 ms rather than a real compile, but it was paid per launch
+(twice per step with split + merge), 0.23-0.42 ms per step against a 40-50 us kernel. Key a launch
+cache only on what changes the generated code (here everything compile-time is in the module's
+traits, so the key is just the stream argument). A fresh value that compiles in ~0.2 ms is the tell
+that the IR does not depend on it. Guard with a test that counts compiles across steps of new
+lengths and batch (monkeypatch the compile entry point) and requires zero after the first.
+
+**Early-exit programs are cheap; restructuring for them may not pay.** Triton split decode with one
+program per fixed segment and a grid sized by `max_seqlen_k` cost at most 1.16x under a 128k graph
+at 4k context: programs past a sequence's keys exit after a few loads. Moving it to FlyDSL's scheme
+(fixed programs, a runtime run of segments per program) made eager decode up to 13 us slower
+(batch 4 x 4k 27.8 -> 41 us; 31 us with the first segment peeled out of the loop; `num_stages=1` on
+the outer loop changed nothing) and was no faster under the graph. The cost under a graph comes from
+work and schedule choices that follow the bound (above), not from idle programs. Measure the
+captured case against a capture at the real length before restructuring a grid.
+
+**What a captured graph freezes, and the one condition for safe replay.** Host code runs once, at
+capture: mode (fused / split), grid, program counts, workspace sizes and launch configuration are
+all fixed from the capture-time arguments; replays only change device memory (`q`, `seq_lens`,
+`cu_seqlens_q`, block table, KV cache). A replay at a growing length is therefore correct as long
+as the kernels read the live length on the device and every real length stays at or below the
+capture-time `max_seqlen_k`. Past it the result is wrong, not slow: segments beyond the grid are
+never computed, and a device-computed run can index past a workspace sized by the bound (an
+out-of-bounds write). A host check of `seq_lens.max()` syncs and cannot run inside a capture; clamp
+on the device or document the contract. The caller must also keep the same buffers (the graph holds
+their pointers) and a fixed batch shape (engines capture per padded batch size).
+
+**The grid never changes the bits.** Only the reduction order does: tile size, absolute segment
+boundaries, backend. Each segment starts from an empty state and walks its tiles in key order; the
+segments' fp32 partials merge in segment order; sinks and normalization come last. Fused mode does
+that in one program, split mode in any assignment of segments to programs with one slot per segment.
+So the grid, program count, run grouping, mode and workspace may all follow `max_seqlen_k` while a
+rollout still matches the training forward bitwise. Prove it with a graph captured at a large bound
+and replayed at shorter lengths, bitwise against eager calls at the true length.
+
 ## Inputs and outputs as the integrations pass them
 
 **Requiring contiguous inputs.** A FlyDSL wrapper asserted contiguous K / V and copied Q, while the
