@@ -100,8 +100,14 @@ failed (unmasked calls never touched the cache; the trainer runs under `no_grad`
 The cache was also unsafe under HIP graphs: its check runs only on the host, so starts cached
 before capture leave the cumsum out of the graph, and replays read stale starts after the engine
 updates `seq_lens` in place. Compute such small derived tensors on every call (they are captured
-into the graph), or inside the kernel's own metadata launch. Run the masked paths under
-`torch.inference_mode()` in tests.
+into the graph), or inside the kernel's own metadata launch; audit every cache on the call path,
+not only the one that raised (the same mask also cached its window-narrowed bounds by window size,
+stale under a graph once the engine updates the bounds in place). The fix left the mask with no
+cached state: window narrowing runs per call, and paged calls pass no key starts (each backend
+derives them from `seq_lens`). Run the masked paths under `torch.inference_mode()` in tests,
+bitwise against the same calls outside it. A graph test that builds the mask inside the captured
+call guards against a cache returning, but cannot show a stale value from a mask built once before
+capture; test that pattern explicitly if the API allows it.
 
 ## Inputs and outputs as the integrations pass them
 
