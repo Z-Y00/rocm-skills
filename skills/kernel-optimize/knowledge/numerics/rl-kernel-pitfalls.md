@@ -92,6 +92,17 @@ So the grid, program count, run grouping, mode and workspace may all follow `max
 rollout still matches the training forward bitwise. Prove it with a graph captured at a large bound
 and replayed at shorter lengths, bitwise against eager calls at the true length.
 
+**Caches keyed on a tensor's version counter.** A mask cached the key starts it derived from
+`seq_lens`, keyed on the tensor's identity and `seq_lens._version`. vLLM builds its attention
+metadata under `torch.inference_mode()`, and inference tensors have no version counter: reading
+`_version` raises "Inference tensors do not track version counter", so every masked paged call
+failed (unmasked calls never touched the cache; the trainer runs under `no_grad`, which is fine).
+The cache was also unsafe under HIP graphs: its check runs only on the host, so starts cached
+before capture leave the cumsum out of the graph, and replays read stale starts after the engine
+updates `seq_lens` in place. Compute such small derived tensors on every call (they are captured
+into the graph), or inside the kernel's own metadata launch. Run the masked paths under
+`torch.inference_mode()` in tests.
+
 ## Inputs and outputs as the integrations pass them
 
 **Requiring contiguous inputs.** A FlyDSL wrapper asserted contiguous K / V and copied Q, while the
@@ -113,6 +124,27 @@ kernel API in global key indices forces a per-step conversion on the caller. Off
 relative form at mask construction and convert once per step on the device (token -> sequence with
 `searchsorted` on `cu_seqlens_q`, no host sync, graph safe), cached on the mask so every layer reuses
 it. Kernels that already subtract each sequence's base need no change.
+
+## Tuning heuristics on real shapes
+
+**Find the factor before writing the rule.** Triton split decode beat fused by 1.1-1.7x at batch
+64-256, context 4k-32k for gpt-oss-120b full attention (64 query / 8 KV heads, D 64) while Llama-3
+8B (32 / 8, D 128) was best fused. Head size and query heads per KV head changed together, so add a
+shape that separates them: Qwen3-32B (64 / 8, D 128) also gained up to 1.46x, and a D 64 shape with 4
+query heads per KV head gained less. The rule became "split when 8+ query heads per KV head or
+D <= 64", not "split at D 64". The old rule (split only when the fused grid has under 2 programs per
+CU) never fired at these batches.
+
+**Measurement order.** In a sweep timing several configurations back to back per shape, the first
+configuration of each backend ran 2-7% slower (FlyDSL `MODE=auto` looked slower than `MODE=fused`
+although both chose the same kernel). Repeat the first configuration at the end of the row, or
+randomize the order, before calling a heuristic wrong.
+
+**What a tuned inference kernel does with `max_seqlen_k`.** aiter's unified attention never passes
+it to a kernel: the host uses it only to cap the split count (`min(cdiv(max_seqlen_k, tile), share)`,
+share from the CU count and the 2D program count), to choose 2D vs split, and as a key of its tuned
+config table; the GPU sizes each segment from the live `seq_len`. The batch-driven split count is the
+part to copy; the length-derived segment size is the part that breaks train/infer bit equality.
 
 ## Coverage that looks complete but is not
 
@@ -137,7 +169,29 @@ against eager.
 ## Toolchain
 
 Bit equality across launch schedules is a property of the generated code, not only of the source:
-the same kernel passed every schedule-invariance test on Triton 3.9 and failed 8 of 226 on an
-integrator's Triton 3.7 (`BLOCK_M=128, num_warps=2`; fp16 split decode). Test on the Triton version
-the integration ships, restrict schedule options to verified ones, and record the version in debug
-dumps (see `batch-invariance.md`, "Toolchain").
+the same kernel passed every schedule-invariance test on Triton 3.9 and failed many on Triton 3.7
+and 3.8 (launch invariance at `BLOCK_M=32, num_warps=1`; paged vs contiguous and split vs fused,
+mostly fp16), bf16 and fp16 alike.
+
+**Contraction choice left to the compiler.** With `enable_fp_fusion` on (Triton's default), an
+expression with two products and an add, here the split-KV segment merge `L * ca + l * cb` and
+`A * ca + a * cb`, may become `fma(L, ca, l * cb)` or `fma(l, cb, L * ca)`: the compiler picks, and
+the pick changed with the launch shape on 3.7 / 3.8 (different code layout) while 3.9 happened to be
+consistent. Fix by construction: compile the kernels with `enable_fp_fusion=False` and spell every
+fused multiply-add you want as `tl.fma`. The cost was within run-to-run noise (decode and training
+forward, MI355X). Expressions with one product (`L * alpha + rowsum`) contract one way only, but
+spell them too, so nothing depends on the flag.
+
+**How it was found.** Compile the failing pair of launch shapes under the other release and compare
+the ISA: both used the same MFMA instruction (16x16x32) for every shape, so the dot products were not
+it; the shapes differed only in cross-lane code. Rows whose keys lay in one segment matched and rows
+merging several segments did not, which pointed at the merge arithmetic. Shrink the segment size in
+the repro so the multi-segment path runs at test sizes.
+
+**Testing other releases from one suite.** One process cannot load two Triton releases. Install each
+release in a list (e.g. 3.7, 3.8, 3.9) once with `pip install --no-deps --target <cache>/<version>`
+and run the bitwise tests in a child process with that directory first on `PYTHONPATH` (and its own
+`TRITON_CACHE_DIR`); check the child really loads that release; skip the running release (the suite
+covers it) and skip when the install fails (no network). Split the child runs into groups that fit
+the CI per-test timeout. Record the Triton version in debug dumps (see `batch-invariance.md`,
+"Toolchain").
